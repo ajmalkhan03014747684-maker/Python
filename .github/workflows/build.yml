@@ -1,0 +1,139 @@
+name: build-apk
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Builds two apps in one run so they are signed with the same key:
+  #   Python-3x.apk        the IDE (Python 3.12)
+  #   Python-3x-Packs.apk  the companion app (Python 3.10: OpenCV, SciPy, scikit-learn ...)
+  # The Packs app is also embedded inside the IDE, so the IDE's Package Manager can install it.
+  # The Python unit tests are not run here, so they can never delay or hang the build.
+  # ---------------------------------------------------------------------------
+  apk:
+    name: "APK build"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Packages bundled in the IDE (each needs a Python 3.12 Android wheel, or be pure Python).
+      ORG_GRADLE_PROJECT_py3xPackages: "numpy,pandas,matplotlib,pillow,pyyaml,lxml,sympy,beautifulsoup4,jinja2,rich,tqdm,click"
+      # Packages bundled in the Packs app (Python 3.10).
+      # scikit-image and statsmodels have Python 3.10 Android wheels. If the Packs build ever fails resolving them,
+      # add a repository variable PY3X_PACKS_EXTRA with the value "tqdm" (already included) to switch the extras off.
+      ORG_GRADLE_PROJECT_py3xPacksPackages: "numpy,pandas,matplotlib,pillow,pyyaml,scipy,scikit-learn,opencv-python,sympy,beautifulsoup4,jinja2,rich,tqdm,click,${{ vars.PY3X_PACKS_EXTRA || 'scikit-image,statsmodels' }}"
+    steps:
+      - name: "APK: checkout repository"
+        uses: actions/checkout@v4
+
+      # Public settings come from the file py3x-config.env in the repo (edit it right in GitHub).
+      # A repository variable with the same purpose, if you set one, wins over the file.
+      - name: "Load public settings from py3x-config.env"
+        env:
+          V_URL: ${{ vars.PY3X_SUPABASE_URL }}
+          V_KEY: ${{ vars.PY3X_SUPABASE_ANON_KEY }}
+          V_ADMOB: ${{ vars.PY3X_ADMOB_APP_ID }}
+        run: |
+          get() { grep -E "^$1=" py3x-config.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r"' | xargs || true; }
+          URL="${V_URL:-$(get SUPABASE_URL)}"; KEY="${V_KEY:-$(get SUPABASE_ANON_KEY)}"; ADMOB="${V_ADMOB:-$(get ADMOB_APP_ID)}"
+          ok() { [ -z "$2" ] && return 0; echo "$2" | grep -Eq "$1" && return 0; echo "::warning::Ignoring a setting that does not look right: $3"; return 1; }
+          ok '^https://[a-z0-9-]+\.supabase\.(co|in)$' "$URL" SUPABASE_URL || URL=""
+          ok '^[A-Za-z0-9._-]+$' "$KEY" SUPABASE_ANON_KEY || KEY=""
+          # Not set anywhere above? Use the App ID typed into the admin panel (Ad Networks -> AdMob), read from your backend.
+          if [ -z "$ADMOB" ] && [ -n "$URL" ] && [ -n "$KEY" ]; then
+            ADMOB=$(curl -fsS --max-time 20 -H "apikey: $KEY" -H "Authorization: Bearer $KEY" \
+              "$URL/rest/v1/app_settings?key=eq.ads&select=value" 2>/dev/null | jq -r '.[0].value.admob_app_id // empty' 2>/dev/null || true)
+            [ -n "$ADMOB" ] && echo "AdMob app id taken from the admin panel."
+          fi
+          ok '^ca-app-pub-[0-9]{16}~[0-9]{10}$' "$ADMOB" ADMOB_APP_ID || ADMOB=""
+          echo "ORG_GRADLE_PROJECT_py3xSupabaseUrl=$URL" >> "$GITHUB_ENV"
+          echo "ORG_GRADLE_PROJECT_py3xSupabaseAnonKey=$KEY" >> "$GITHUB_ENV"
+          echo "ORG_GRADLE_PROJECT_py3xAdmobAppId=$ADMOB" >> "$GITHUB_ENV"
+          [ -n "$URL" ] && echo "Online backend: ON" || echo "Online backend: not configured (the app works offline)"
+          [ -n "$ADMOB" ] && echo "AdMob app id: set" || echo "AdMob app id: not set (Google test ads only)"
+
+      - name: "APK: set up Python 3.12 and 3.10 (Chaquopy needs them to bundle packages)"
+        uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.12
+            3.10
+
+      - name: "APK: unpack project"
+        run: unzip -q python-3x-android-ide.zip
+
+      - name: "APK: set up Java 17"
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: "APK: accept Android SDK licenses"
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      # Both apps must be signed with the same key for the signature-level permission between them.
+      # The key is created by the first build and kept in the GitHub cache, so later builds can update
+      # the installed apps instead of requiring an uninstall. (GitHub drops caches unused for 7 days.)
+      - name: "APK: restore signing key"
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: py3x-debug-keystore-v1
+
+      # Optional permanent key: if the repository secret PY3X_KEYSTORE_B64 exists (made once by the
+      # make-signing-key workflow) it replaces the cached key, so updates always install over old builds.
+      - name: "APK: use permanent signing key (if set)"
+        env:
+          KS: ${{ secrets.PY3X_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KS" ]; then
+            mkdir -p ~/.android
+            # Accepts the bare key or a whole pasted log: the key is the one long base64 run.
+            echo "$KS" | tr -d '\r' | grep -Eo '[A-Za-z0-9+/=]{200,}' | head -1 | base64 -d > ~/.android/debug.keystore
+            echo "Using the permanent signing key."
+          else
+            echo "No PY3X_KEYSTORE_B64 secret: using the cached key."
+          fi
+
+      - name: "APK: set up Gradle 8.10.2"
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: "APK: build the Packs app"
+        run: cd python-3x-android-ide/android && gradle --no-daemon :packs:assembleFast
+
+      - name: "APK: embed the Packs app in the IDE"
+        run: |
+          cd python-3x-android-ide/android
+          mkdir -p app/src/main/assets/packs
+          cp packs/build/outputs/apk/fast/*.apk app/src/main/assets/packs/python3x-packs.apk
+          ls -l app/src/main/assets/packs
+
+      - name: "APK: build the IDE"
+        run: cd python-3x-android-ide/android && gradle --no-daemon :app:assembleFast
+
+      - name: "APK: collect results"
+        run: |
+          mkdir -p out
+          cp python-3x-android-ide/android/app/build/outputs/apk/fast/*.apk out/Python-3x.apk
+          cp python-3x-android-ide/android/packs/build/outputs/apk/fast/*.apk out/Python-3x-Packs.apk
+          ls -l out
+
+      # Two separate downloads so you normally fetch only the IDE (Packs is already inside it).
+      - name: "APK: upload IDE (download this one each time)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-3x-IDE
+          path: out/Python-3x.apk
+          retention-days: 1       # keeps old builds from filling your free storage
+          compression-level: 0    # an APK is already compressed
+
+      - name: "APK: upload Packs app (only needed when Packs changed)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-3x-Packs-optional
+          path: out/Python-3x-Packs.apk
+          retention-days: 1
+          compression-level: 0
