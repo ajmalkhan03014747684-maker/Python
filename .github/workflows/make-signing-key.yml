@@ -1,0 +1,27 @@
+name: make-signing-key
+
+# Run this ONCE (Actions -> make-signing-key -> Run workflow). It prints your permanent signing key.
+#  1. Copy the long text between the markers into a repository secret named PY3X_KEYSTORE_B64
+#     (Settings -> Secrets and variables -> Actions -> New repository secret).
+#  2. SAVE THE SAME TEXT somewhere private, in two places (a password manager or a locked note). A secret on
+#     GitHub can never be read back, and if you lose the key you can never update your app.
+#  3. Then DELETE this run (open the run -> ... -> Delete workflow run) so the key is not left in the logs.
+# Never post the text anywhere public. Anyone holding it can publish updates as you.
+on:
+  workflow_dispatch:
+
+jobs:
+  key:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Create key"
+        run: |
+          keytool -genkeypair -keystore k.jks -storetype JKS -alias androiddebugkey \
+            -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Python 3.x, O=Python 3.x, C=US"
+          echo "Key fingerprint (safe to write down, it lets you recognise this key later):"
+          keytool -list -v -keystore k.jks -storepass android | grep -m1 "SHA256:"
+          echo "-----BEGIN PY3X KEY (copy everything between the lines)-----"
+          base64 -w0 k.jks
+          echo
+          echo "-----END PY3X KEY-----"
